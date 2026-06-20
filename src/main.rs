@@ -1,5 +1,6 @@
 mod memtable;
 mod types;
+mod wal;
 
 use crate::memtable::MemTable;
 
