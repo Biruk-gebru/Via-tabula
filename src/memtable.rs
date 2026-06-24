@@ -3,7 +3,9 @@
 //         Vec<u8> moves ownership into the map so the map fully owns its data and no lifetime is needed.
 use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::path::{Path, PathBuf};
 
+use crate::sstable::writer::{SsTableError, SsTableWriter};
 use crate::types::is_tombstone;
 
 pub struct MemTable {
@@ -30,6 +32,15 @@ impl MemTable {
         self.data.iter().map(|(k, v)| k.len() + v.len()).sum()
     }
 
+    pub fn flush(&self, path: &Path) -> Result<PathBuf, SsTableError> {
+        let mut writer = SsTableWriter::new(path)?;
+        for (key, value) in self {
+            writer.add(key, value)?;
+        }
+        writer.finish()?;
+        Ok(path.to_path_buf())
+    }
+
     pub fn scan<'a>(
         &'a self,
         start: &[u8],
@@ -52,6 +63,11 @@ impl<'a> IntoIterator for &'a MemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn tmp_path(name: &str) -> PathBuf {
+        PathBuf::from(format!("/tmp/tabula_test_{}.sst", name))
+    }
 
     #[test]
     fn test_set_and_get() {
@@ -88,6 +104,64 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, &b"banana".to_vec());
         assert_eq!(results[1].0, &b"cherry".to_vec());
+    }
+
+    #[test]
+    fn test_flush_creates_file() {
+        let mut t = MemTable::new();
+        t.set(b"apple".to_vec(), b"1".to_vec());
+        t.set(b"banana".to_vec(), b"2".to_vec());
+        t.set(b"cherry".to_vec(), b"3".to_vec());
+
+        let path = tmp_path("flush_creates");
+        let _ = std::fs::remove_file(&path);
+
+        let result = t.flush(&path).unwrap();
+        assert_eq!(result, path);
+        assert!(path.exists());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_flush_file_has_valid_footer() {
+        let mut t = MemTable::new();
+        t.set(b"apple".to_vec(), b"1".to_vec());
+        t.set(b"banana".to_vec(), b"2".to_vec());
+
+        let path = tmp_path("flush_footer");
+        let _ = std::fs::remove_file(&path);
+        t.flush(&path).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() >= 16, "file must be at least 16 bytes for footer");
+
+        let footer_start = bytes.len() - 16;
+        let index_offset = u64::from_le_bytes(bytes[footer_start..footer_start + 8].try_into().unwrap());
+        let index_len = u64::from_le_bytes(bytes[footer_start + 8..footer_start + 16].try_into().unwrap());
+
+        assert!(index_offset < bytes.len() as u64, "index_offset must be inside file");
+        assert!(index_offset + index_len <= footer_start as u64, "index block must not overlap footer");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_flush_excludes_tombstones() {
+        let mut t = MemTable::new();
+        t.set(b"apple".to_vec(), b"1".to_vec());
+        t.set(b"banana".to_vec(), b"2".to_vec());
+        t.delete(b"apple".to_vec());
+
+        let path = tmp_path("flush_tombstone");
+        let _ = std::fs::remove_file(&path);
+        t.flush(&path).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!bytes.windows(b"apple".len()).any(|w| w == b"apple"),
+            "tombstoned key must not appear in SSTable");
+
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
