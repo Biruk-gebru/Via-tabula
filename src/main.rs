@@ -1,4 +1,5 @@
 mod memtable;
+mod sstable;
 mod types;
 mod wal;
 
