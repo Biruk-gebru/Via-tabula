@@ -11,7 +11,38 @@ pub struct SsTableReader {
     data_end: u64,
 }
 
-pub struct SsTableIter;
+pub struct SsTableIter<'a> {
+    file: &'a mut File,
+    pos: u64,
+    data_end: u64,
+}
+
+impl<'a> Iterator for SsTableIter<'a> {
+    type Item = (Vec<u8>, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.data_end {
+            return None;
+        }
+
+        let mut len_buf = [0u8; 4];
+        self.file.read_exact(&mut len_buf).ok()?;
+        let key_len = u32::from_le_bytes(len_buf) as usize;
+
+        let mut key = vec![0u8; key_len];
+        self.file.read_exact(&mut key).ok()?;
+
+        self.file.read_exact(&mut len_buf).ok()?;
+        let val_len = u32::from_le_bytes(len_buf) as usize;
+
+        let mut val = vec![0u8; val_len];
+        self.file.read_exact(&mut val).ok()?;
+
+        self.pos += (4 + key_len + 4 + val_len) as u64;
+
+        Some((key, val))
+    }
+}
 
 impl SsTableReader {
     pub fn open(path: &Path) -> Result<Self, SsTableError> {
@@ -114,8 +145,16 @@ impl SsTableReader {
         Ok(None)
     }
 
-    pub fn iter(&self) -> SsTableIter {
-        todo!("full sequential scan of the data section")
+    pub fn iter(&mut self) -> Result<SsTableIter<'_>, SsTableError> {
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| SsTableError::Io)?;
+
+        Ok(SsTableIter {
+            file: &mut self.file,
+            pos: 0,
+            data_end: self.data_end,
+        })
     }
 }
 
@@ -171,6 +210,26 @@ mod tests {
             Some(b"still here".to_vec())
         );
         assert_eq!(reader.get(b"gone").unwrap(), None);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn iter_yields_every_key_in_sorted_order() {
+        let path = temp_dir().join("tabula_reader_test_iter.sst");
+        let mut writer = SsTableWriter::new(&path).unwrap();
+        let mut expected = Vec::new();
+        for i in 0..500u32 {
+            let key = format!("key-{:05}", i).into_bytes();
+            let val = format!("val-{:05}", i).into_bytes();
+            writer.add(&key, &val).unwrap();
+            expected.push((key, val));
+        }
+        writer.finish().unwrap();
+
+        let mut reader = SsTableReader::open(&path).unwrap();
+        let collected: Vec<(Vec<u8>, Vec<u8>)> = reader.iter().unwrap().collect();
+        assert_eq!(collected, expected);
 
         std::fs::remove_file(&path).ok();
     }
