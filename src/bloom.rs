@@ -5,3 +5,4 @@
 //   k = (m / n) * ln 2          (number of hash functions)
 // So for p = 1% and n = 10000 we get m = 95,851 and k = 7, rounding both to the nearest
 // integer since bit array size and hash function count must be whole numbers.
+//But for now we will only work with 2 hash functions to make things easier
