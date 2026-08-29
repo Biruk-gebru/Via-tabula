@@ -1,3 +1,4 @@
+mod bloom;
 mod memtable;
 mod sstable;
 mod types;
