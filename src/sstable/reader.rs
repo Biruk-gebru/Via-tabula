@@ -1,3 +1,8 @@
+//Read amplification: the amount of extra bytes we have to read from disk affecting disk IO
+//Here read amplification is ~4kb
+//Tradeoff is for a lower RA we will have to store more on the indexes in Vec which can be memory consumptive which is not the best scenario the other hand a larger RA mean we take significantly more time to get a single entry which is expensive for a disk read
+//Therfore the ideal spot for an RA is somewhere inbetween where the index amount isnt as much but also we dont have to look too much inbetween indexes
+
 use crate::sstable::writer::SsTableError;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -178,11 +183,19 @@ mod tests {
         writer.finish().unwrap();
 
         let mut reader = SsTableReader::open(&path).unwrap();
-        assert!(reader.index.len() > 1, "expected multiple index checkpoints");
+        assert!(
+            reader.index.len() > 1,
+            "expected multiple index checkpoints"
+        );
 
         for (k, v) in &keys {
             let got = reader.get(k).unwrap();
-            assert_eq!(got.as_ref(), Some(v), "missing key {:?}", String::from_utf8_lossy(k));
+            assert_eq!(
+                got.as_ref(),
+                Some(v),
+                "missing key {:?}",
+                String::from_utf8_lossy(k)
+            );
         }
 
         assert_eq!(reader.get(b"aaa-not-present").unwrap(), None);
@@ -205,10 +218,7 @@ mod tests {
         memtable.flush(&path).unwrap();
 
         let mut reader = SsTableReader::open(&path).unwrap();
-        assert_eq!(
-            reader.get(b"alive").unwrap(),
-            Some(b"still here".to_vec())
-        );
+        assert_eq!(reader.get(b"alive").unwrap(), Some(b"still here".to_vec()));
         assert_eq!(reader.get(b"gone").unwrap(), None);
 
         std::fs::remove_file(&path).ok();
