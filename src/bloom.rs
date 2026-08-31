@@ -74,6 +74,25 @@ impl BloomFilter {
             self.bits[byte_index] |= 1 << bit_index;
         }
     }
+
+    pub fn may_contain(&self, key: &[u8]) -> bool {
+        let h1 = Self::fnv_1a(key);
+        let h2 = Self::djb2(key);
+
+        for i in 0..self.k {
+            let combined = h1.wrapping_add((i as u64).wrapping_mul(h2));
+            let pos = (combined % self.m as u64) as usize;
+
+            let byte_index = pos / 8;
+            let bit_index = pos % 8;
+
+            if self.bits[byte_index] & (1 << bit_index) == 0 {
+                return false;
+            }
+        }
+
+        true
+    }
 }
 
 #[cfg(test)]
@@ -142,5 +161,47 @@ mod tests {
         let total_bits_set: u32 = filter.bits.iter().map(|b| b.count_ones()).sum();
         let bits_before_set: u32 = bits_before.iter().map(|b| b.count_ones()).sum();
         assert!(total_bits_set > bits_before_set);
+    }
+
+    #[test]
+    fn may_contain_never_false_negatives() {
+        let mut filter = BloomFilter::new(10_000, 0.01);
+        let keys: Vec<Vec<u8>> = (0..10_000)
+            .map(|i| format!("key-{i}").into_bytes())
+            .collect();
+
+        for key in &keys {
+            filter.insert(key);
+        }
+
+        for key in &keys {
+            assert!(
+                filter.may_contain(key),
+                "inserted key {:?} was reported absent",
+                String::from_utf8_lossy(key)
+            );
+        }
+    }
+
+    #[test]
+    fn may_contain_false_positive_rate_is_acceptable() {
+        let mut filter = BloomFilter::new(10_000, 0.01);
+        for i in 0..10_000 {
+            filter.insert(format!("inserted-{i}").as_bytes());
+        }
+
+        let mut false_positives = 0;
+        for i in 0..10_000 {
+            let absent_key = format!("absent-{i}");
+            if filter.may_contain(absent_key.as_bytes()) {
+                false_positives += 1;
+            }
+        }
+
+        let observed_rate = false_positives as f64 / 10_000.0;
+        assert!(
+            observed_rate < 0.02,
+            "observed false-positive rate {observed_rate} exceeds 2%"
+        );
     }
 }
