@@ -93,6 +93,25 @@ impl BloomFilter {
 
         true
     }
+
+    // Serialised as [k: 8B][m: 8B][bits: m.div_ceil(8) bytes] so a reader can
+    // reconstruct a working BloomFilter without needing access to its private fields.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(16 + self.bits.len());
+        bytes.extend_from_slice(&(self.k as u64).to_le_bytes());
+        bytes.extend_from_slice(&(self.m as u64).to_le_bytes());
+        bytes.extend_from_slice(&self.bits);
+        bytes
+    }
+
+    // Reverses to_bytes: [k: 8B][m: 8B][bits: rest] -> a working BloomFilter.
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let k = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+        let m = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let bits = bytes[16..].to_vec();
+
+        BloomFilter { bits, k, m }
+    }
 }
 
 #[cfg(test)]
