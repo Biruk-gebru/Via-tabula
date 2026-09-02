@@ -3,6 +3,7 @@
 //Tradeoff is for a lower RA we will have to store more on the indexes in Vec which can be memory consumptive which is not the best scenario the other hand a larger RA mean we take significantly more time to get a single entry which is expensive for a disk read
 //Therfore the ideal spot for an RA is somewhere inbetween where the index amount isnt as much but also we dont have to look too much inbetween indexes
 
+use crate::bloom::BloomFilter;
 use crate::sstable::writer::SsTableError;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -12,8 +13,9 @@ pub struct SsTableReader {
     file: File,
     // sparse index: (key, byte offset of that key's record in the data section)
     index: Vec<(Vec<u8>, u64)>,
-    // byte offset where the data section ends (== index_offset from the footer)
+    // byte offset where the data section ends (== filter_offset from the footer)
     data_end: u64,
+    filter: BloomFilter,
 }
 
 pub struct SsTableIter<'a> {
@@ -51,17 +53,30 @@ impl<'a> Iterator for SsTableIter<'a> {
 
 impl SsTableReader {
     pub fn open(path: &Path) -> Result<Self, SsTableError> {
-        // read the 16B footer to learn where the index block starts and how long it is
+        // read the 32B footer to learn where the filter and index sections start and
+        // how long each one is
         let mut file = File::open(path).map_err(|_| SsTableError::Io)?;
 
-        file.seek(SeekFrom::End(-16))
+        file.seek(SeekFrom::End(-32))
             .map_err(|_| SsTableError::Io)?;
 
-        let mut footer = [0u8; 16];
+        let mut footer = [0u8; 32];
         file.read_exact(&mut footer).map_err(|_| SsTableError::Io)?;
 
-        let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
-        let index_len = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+        let filter_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+        let filter_len = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+        let index_offset = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+        let index_len = u64::from_le_bytes(footer[24..32].try_into().unwrap());
+
+        // seek to the bloom filter section and read it in full
+        file.seek(SeekFrom::Start(filter_offset))
+            .map_err(|_| SsTableError::Io)?;
+
+        let mut filter_bytes = vec![0u8; filter_len as usize];
+        file.read_exact(&mut filter_bytes)
+            .map_err(|_| SsTableError::Io)?;
+
+        let filter = BloomFilter::from_bytes(&filter_bytes);
 
         // seek to the index block and read it in full
         file.seek(SeekFrom::Start(index_offset))
@@ -91,11 +106,17 @@ impl SsTableReader {
         Ok(SsTableReader {
             file,
             index,
-            data_end: index_offset,
+            data_end: filter_offset,
+            filter,
         })
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, SsTableError> {
+        // definitely absent: skip the index search and the disk seek entirely
+        if !self.filter.may_contain(key) {
+            return Ok(None);
+        }
+
         let search_result = self
             .index
             .binary_search_by(|entry| entry.0.as_slice().cmp(key));
@@ -172,7 +193,7 @@ mod tests {
     #[test]
     fn get_finds_every_key_across_many_checkpoints() {
         let path = temp_dir().join("tabula_reader_test_get.sst");
-        let mut writer = SsTableWriter::new(&path).unwrap();
+        let mut writer = SsTableWriter::new(&path, 2000).unwrap();
         let mut keys = Vec::new();
         for i in 0..2000u32 {
             let key = format!("key-{:05}", i).into_bytes();
@@ -227,7 +248,7 @@ mod tests {
     #[test]
     fn iter_yields_every_key_in_sorted_order() {
         let path = temp_dir().join("tabula_reader_test_iter.sst");
-        let mut writer = SsTableWriter::new(&path).unwrap();
+        let mut writer = SsTableWriter::new(&path, 500).unwrap();
         let mut expected = Vec::new();
         for i in 0..500u32 {
             let key = format!("key-{:05}", i).into_bytes();
