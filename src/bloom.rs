@@ -10,6 +10,13 @@
 // h_i(key) = h1(key) + i * h2(key), for i in 0..k. k itself stays the computed value above
 // (7), not 2 — "2 hash functions" refers to the implementation primitives, not k.
 
+// It's impossible to have false negatives because bits are only ever turned on, never off,
+// during insertion, so a key that was truly inserted will always find all its bits still
+// set. False positives happen because different keys can collide onto the same bit
+// positions: if an absent key's hashes happen to land only on bits that other keys already
+// set, may_contain returns true even though that exact key was never inserted, and there is
+// no way to tell the difference from the bit array alone.
+
 pub struct BloomFilter {
     bits: Vec<u8>,
     k: usize,
