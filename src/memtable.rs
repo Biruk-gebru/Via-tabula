@@ -33,7 +33,7 @@ impl MemTable {
     }
 
     pub fn flush(&self, path: &Path) -> Result<PathBuf, SsTableError> {
-        let mut writer = SsTableWriter::new(path)?;
+        let mut writer = SsTableWriter::new(path, self.data.len())?;
         for (key, value) in self {
             writer.add(key, value)?;
         }
@@ -134,14 +134,28 @@ mod tests {
         t.flush(&path).unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
-        assert!(bytes.len() >= 16, "file must be at least 16 bytes for footer");
+        assert!(
+            bytes.len() >= 16,
+            "file must be at least 16 bytes for footer"
+        );
 
         let footer_start = bytes.len() - 16;
-        let index_offset = u64::from_le_bytes(bytes[footer_start..footer_start + 8].try_into().unwrap());
-        let index_len = u64::from_le_bytes(bytes[footer_start + 8..footer_start + 16].try_into().unwrap());
+        let index_offset =
+            u64::from_le_bytes(bytes[footer_start..footer_start + 8].try_into().unwrap());
+        let index_len = u64::from_le_bytes(
+            bytes[footer_start + 8..footer_start + 16]
+                .try_into()
+                .unwrap(),
+        );
 
-        assert!(index_offset < bytes.len() as u64, "index_offset must be inside file");
-        assert!(index_offset + index_len <= footer_start as u64, "index block must not overlap footer");
+        assert!(
+            index_offset < bytes.len() as u64,
+            "index_offset must be inside file"
+        );
+        assert!(
+            index_offset + index_len <= footer_start as u64,
+            "index block must not overlap footer"
+        );
 
         std::fs::remove_file(&path).unwrap();
     }
@@ -158,8 +172,10 @@ mod tests {
         t.flush(&path).unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
-        assert!(!bytes.windows(b"apple".len()).any(|w| w == b"apple"),
-            "tombstoned key must not appear in SSTable");
+        assert!(
+            !bytes.windows(b"apple".len()).any(|w| w == b"apple"),
+            "tombstoned key must not appear in SSTable"
+        );
 
         std::fs::remove_file(&path).unwrap();
     }
@@ -186,14 +202,17 @@ mod tests {
 
         // expected sorted: banana, cherry, date, fig, grape, honeydew (elderberry filtered)
         let keys: Vec<&Vec<u8>> = results.iter().map(|(k, _)| *k).collect();
-        assert_eq!(keys, vec![
-            &b"banana".to_vec(),
-            &b"cherry".to_vec(),
-            &b"date".to_vec(),
-            &b"fig".to_vec(),
-            &b"grape".to_vec(),
-            &b"honeydew".to_vec(),
-            &b"jackfruit".to_vec(),
-        ]);
+        assert_eq!(
+            keys,
+            vec![
+                &b"banana".to_vec(),
+                &b"cherry".to_vec(),
+                &b"date".to_vec(),
+                &b"fig".to_vec(),
+                &b"grape".to_vec(),
+                &b"honeydew".to_vec(),
+                &b"jackfruit".to_vec(),
+            ]
+        );
     }
 }
