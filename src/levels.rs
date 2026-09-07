@@ -164,7 +164,16 @@ mod tests {
         manager.add_l0_file(build_sstable("compact_2", "banana", "banana-val"));
         manager.add_l0_file(build_sstable("compact_3", "cherry", "cherry-val"));
 
+        let old_l0_paths: Vec<PathBuf> = manager.levels[0].clone();
+
         manager.compact().unwrap();
+
+        for path in &old_l0_paths {
+            assert!(
+                !path.exists(),
+                "old L0 file {path:?} must be deleted after compaction"
+            );
+        }
 
         assert!(
             manager.levels[0].is_empty(),
