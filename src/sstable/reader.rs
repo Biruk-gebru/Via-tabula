@@ -5,6 +5,7 @@
 
 use crate::bloom::BloomFilter;
 use crate::sstable::writer::SsTableError;
+use crate::types::is_tombstone;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -162,7 +163,14 @@ impl SsTableReader {
             pos += (4 + key_len + 4 + val_len) as u64;
 
             match record_key.as_slice().cmp(key) {
-                std::cmp::Ordering::Equal => return Ok(Some(record_val)),
+                std::cmp::Ordering::Equal => {
+                    // now that flush persists tombstones (so an older SSTable's value can't
+                    // resurrect), get must hide the sentinel from callers itself
+                    if is_tombstone(&record_val) {
+                        return Ok(None);
+                    }
+                    return Ok(Some(record_val));
+                }
                 std::cmp::Ordering::Greater => return Ok(None),
                 std::cmp::Ordering::Less => continue,
             }
@@ -241,6 +249,33 @@ mod tests {
         let mut reader = SsTableReader::open(&path).unwrap();
         assert_eq!(reader.get(b"alive").unwrap(), Some(b"still here".to_vec()));
         assert_eq!(reader.get(b"gone").unwrap(), None);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn iter_still_surfaces_raw_tombstone_records() {
+        use crate::memtable::MemTable;
+
+        let path = temp_dir().join("tabula_reader_test_iter_tombstone.sst");
+        let mut memtable = MemTable::new();
+        memtable.set(b"alive".to_vec(), b"still here".to_vec());
+        memtable.set(b"gone".to_vec(), b"will be deleted".to_vec());
+        memtable.delete(b"gone".to_vec());
+
+        memtable.flush(&path).unwrap();
+
+        // compaction (M7) needs to see the raw tombstone record via iter to decide
+        // whether it's safe to drop, so unlike get, iter must not hide it
+        let mut reader = SsTableReader::open(&path).unwrap();
+        let collected: Vec<(Vec<u8>, Vec<u8>)> = reader.iter().unwrap().collect();
+        assert_eq!(
+            collected,
+            vec![
+                (b"alive".to_vec(), b"still here".to_vec()),
+                (b"gone".to_vec(), b"__TOMBSTONE__".to_vec()),
+            ]
+        );
 
         std::fs::remove_file(&path).ok();
     }
