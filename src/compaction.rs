@@ -1,3 +1,9 @@
+// L1+ files need non-overlapping ranges to avoid read amplification: without that
+// guarantee, a simple get could turn into reading every file in that level, since any
+// of them could hold the key. Because the ranges never overlap, we can check each
+// file's min and max key first, ruling most files out immediately, then go straight to
+// the one appropriate file and read only that single file.
+
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::path::Path;
@@ -192,7 +198,11 @@ mod tests {
         // each surviving key appears exactly once in the merged output (6 unique
         // survivors: apple, cherry, date, elderberry, fig, grape; banana dropped)
         let all: Vec<(Vec<u8>, Vec<u8>)> = merged.iter().unwrap().collect();
-        assert_eq!(all.len(), 6, "expected exactly 6 surviving keys, got {all:?}");
+        assert_eq!(
+            all.len(),
+            6,
+            "expected exactly 6 surviving keys, got {all:?}"
+        );
 
         let mut seen_keys: Vec<&Vec<u8>> = all.iter().map(|(k, _)| k).collect();
         let unique_count = {
