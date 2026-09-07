@@ -124,3 +124,123 @@ impl LevelManager {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memtable::MemTable;
+    use std::env::temp_dir;
+
+    fn build_sstable(name: &str, key: &str, value: &str) -> PathBuf {
+        let path = temp_dir().join(format!("tabula_levels_test_{name}.sst"));
+        let mut memtable = MemTable::new();
+        memtable.set(key.as_bytes().to_vec(), value.as_bytes().to_vec());
+        memtable.flush(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn needs_compaction_true_once_l0_hits_threshold() {
+        let mut manager = LevelManager::new();
+        assert!(!manager.needs_compaction());
+
+        for i in 0..3 {
+            manager.add_l0_file(build_sstable(&format!("threshold_{i}"), "k", "v"));
+        }
+        assert!(!manager.needs_compaction(), "3 files should not trigger yet");
+
+        manager.add_l0_file(build_sstable("threshold_3", "k", "v"));
+        assert!(manager.needs_compaction(), "4 files should trigger");
+
+        for path in &manager.levels[0] {
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    #[test]
+    fn compact_merges_l0_into_l1_and_clears_l0() {
+        let mut manager = LevelManager::new();
+        manager.add_l0_file(build_sstable("compact_0", "apple", "newest"));
+        manager.add_l0_file(build_sstable("compact_1", "apple", "stale"));
+        manager.add_l0_file(build_sstable("compact_2", "banana", "banana-val"));
+        manager.add_l0_file(build_sstable("compact_3", "cherry", "cherry-val"));
+
+        manager.compact().unwrap();
+
+        assert!(
+            manager.levels[0].is_empty(),
+            "L0 must be empty after compaction"
+        );
+        assert_eq!(
+            manager.levels[1].len(),
+            1,
+            "L1 must hold exactly one merged file when it started empty"
+        );
+
+        let l1_path = &manager.levels[1][0];
+        let mut reader = SsTableReader::open(l1_path).unwrap();
+        assert_eq!(reader.get(b"apple").unwrap(), Some(b"newest".to_vec()));
+        assert_eq!(
+            reader.get(b"banana").unwrap(),
+            Some(b"banana-val".to_vec())
+        );
+        assert_eq!(
+            reader.get(b"cherry").unwrap(),
+            Some(b"cherry-val".to_vec())
+        );
+
+        std::fs::remove_file(l1_path).ok();
+    }
+
+    #[test]
+    fn compact_leaves_non_overlapping_l1_file_untouched() {
+        let mut manager = LevelManager::new();
+
+        // pre-existing L1 file whose key range ("zebra") is nowhere near L0's
+        // ("apple".."cherry") below; nothing being merged could affect it
+        let untouched_path = build_sstable("l1_untouched", "zebra", "old-zebra");
+        manager.levels = vec![vec![], vec![untouched_path.clone()]];
+
+        manager.add_l0_file(build_sstable("overlap_0", "apple", "apple-val"));
+        manager.add_l0_file(build_sstable("overlap_1", "banana", "banana-val"));
+        manager.add_l0_file(build_sstable("overlap_2", "cherry", "cherry-val"));
+        manager.add_l0_file(build_sstable("overlap_3", "date", "date-val"));
+
+        manager.compact().unwrap();
+
+        assert_eq!(
+            manager.levels[1].len(),
+            2,
+            "the untouched L1 file plus one new merged file"
+        );
+        assert!(
+            manager.levels[1].contains(&untouched_path),
+            "non-overlapping L1 file must survive compaction unchanged"
+        );
+
+        // the untouched file's own content must be unaffected
+        let mut untouched_reader = SsTableReader::open(&untouched_path).unwrap();
+        assert_eq!(
+            untouched_reader.get(b"zebra").unwrap(),
+            Some(b"old-zebra".to_vec())
+        );
+
+        // the new merged file holds everything from the overlapping L0 batch
+        let merged_path = manager.levels[1]
+            .iter()
+            .find(|p| **p != untouched_path)
+            .unwrap();
+        let mut merged_reader = SsTableReader::open(merged_path).unwrap();
+        assert_eq!(
+            merged_reader.get(b"apple").unwrap(),
+            Some(b"apple-val".to_vec())
+        );
+        assert_eq!(
+            merged_reader.get(b"date").unwrap(),
+            Some(b"date-val".to_vec())
+        );
+
+        for path in &manager.levels[1] {
+            std::fs::remove_file(path).ok();
+        }
+    }
+}
