@@ -116,3 +116,94 @@ pub fn merge_sstables(
     writer.finish()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memtable::MemTable;
+    use std::env::temp_dir;
+
+    // builds one L0 SSTable file from a list of (key, is_delete, value) ops, in the
+    // given order, and returns its path
+    fn build_sstable(name: &str, ops: &[(&str, Option<&str>)]) -> std::path::PathBuf {
+        let path = temp_dir().join(format!("tabula_compaction_test_{name}.sst"));
+        let mut memtable = MemTable::new();
+        for (key, value) in ops {
+            match value {
+                Some(v) => memtable.set(key.as_bytes().to_vec(), v.as_bytes().to_vec()),
+                None => memtable.delete(key.as_bytes().to_vec()),
+            }
+        }
+        memtable.flush(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn merge_sstables_dedupes_tombstones_and_keeps_newest() {
+        // 6 L0 files, index 0 = most recently flushed. Some keys appear in multiple
+        // files to exercise the "keep newest, skip tombstones" logic.
+        let paths = vec![
+            build_sstable(
+                "0_newest",
+                &[("apple", Some("new-apple")), ("banana", None)],
+            ),
+            build_sstable(
+                "1",
+                &[("apple", Some("old-apple")), ("cherry", Some("cherry-val"))],
+            ),
+            build_sstable(
+                "2",
+                &[("banana", Some("old-banana")), ("date", Some("date-val"))],
+            ),
+            build_sstable("3", &[("elderberry", Some("elderberry-val"))]),
+            build_sstable("4", &[("fig", Some("fig-val"))]),
+            build_sstable(
+                "5_oldest",
+                &[("grape", Some("grape-val")), ("cherry", Some("old-cherry"))],
+            ),
+        ];
+
+        let readers: Vec<SsTableReader> = paths
+            .iter()
+            .map(|p| SsTableReader::open(p).unwrap())
+            .collect();
+
+        let output_path = temp_dir().join("tabula_compaction_test_output.sst");
+        merge_sstables(readers, &output_path).unwrap();
+
+        let mut merged = SsTableReader::open(&output_path).unwrap();
+
+        // apple: newest value from file 0 wins over file 1's stale copy
+        assert_eq!(merged.get(b"apple").unwrap(), Some(b"new-apple".to_vec()));
+        // banana: file 0's tombstone is the newest record, so it's gone entirely
+        assert_eq!(merged.get(b"banana").unwrap(), None);
+        // cherry: file 1 (index 1) beats file 5 (index 5) as the more recent copy
+        assert_eq!(merged.get(b"cherry").unwrap(), Some(b"cherry-val".to_vec()));
+        // keys that only ever appeared once pass through unchanged
+        assert_eq!(merged.get(b"date").unwrap(), Some(b"date-val".to_vec()));
+        assert_eq!(
+            merged.get(b"elderberry").unwrap(),
+            Some(b"elderberry-val".to_vec())
+        );
+        assert_eq!(merged.get(b"fig").unwrap(), Some(b"fig-val".to_vec()));
+        assert_eq!(merged.get(b"grape").unwrap(), Some(b"grape-val".to_vec()));
+
+        // each surviving key appears exactly once in the merged output (6 unique
+        // survivors: apple, cherry, date, elderberry, fig, grape; banana dropped)
+        let all: Vec<(Vec<u8>, Vec<u8>)> = merged.iter().unwrap().collect();
+        assert_eq!(all.len(), 6, "expected exactly 6 surviving keys, got {all:?}");
+
+        let mut seen_keys: Vec<&Vec<u8>> = all.iter().map(|(k, _)| k).collect();
+        let unique_count = {
+            seen_keys.sort();
+            seen_keys.dedup();
+            seen_keys.len()
+        };
+        assert_eq!(unique_count, 6, "every surviving key must be unique");
+
+        for path in &paths {
+            std::fs::remove_file(path).ok();
+        }
+        std::fs::remove_file(&output_path).ok();
+    }
+}
