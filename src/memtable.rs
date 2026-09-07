@@ -52,11 +52,16 @@ impl MemTable {
     }
 }
 
+// Unlike scan (a live read path, which must hide tombstones from callers), flush uses
+// this to persist the MemTable to disk, and tombstones must survive that: an older
+// SSTable on disk may still hold the deleted key, so the deletion has to be written as a
+// real record or that old value would resurrect itself on a later read. Tombstones are
+// only safe to drop once compaction confirms no older SSTable still holds the key.
 impl<'a> IntoIterator for &'a MemTable {
     type Item = (&'a Vec<u8>, &'a Vec<u8>);
-    type IntoIter = Box<dyn Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)> + 'a>;
+    type IntoIter = std::collections::btree_map::Iter<'a, Vec<u8>, Vec<u8>>;
     fn into_iter(self) -> Self::IntoIter {
-        Box::new(self.data.iter().filter(|(_, v)| !is_tombstone(v)))
+        self.data.iter()
     }
 }
 
@@ -161,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn test_flush_excludes_tombstones() {
+    fn test_flush_persists_tombstones() {
         let mut t = MemTable::new();
         t.set(b"apple".to_vec(), b"1".to_vec());
         t.set(b"banana".to_vec(), b"2".to_vec());
@@ -171,10 +176,18 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         t.flush(&path).unwrap();
 
+        // the key's record must still be written, holding the tombstone sentinel, so an
+        // older SSTable's value for "apple" can't resurrect on a later read
         let bytes = std::fs::read(&path).unwrap();
         assert!(
-            !bytes.windows(b"apple".len()).any(|w| w == b"apple"),
-            "tombstoned key must not appear in SSTable"
+            bytes.windows(b"apple".len()).any(|w| w == b"apple"),
+            "tombstoned key's record must still be persisted to the SSTable"
+        );
+        assert!(
+            bytes
+                .windows(b"__TOMBSTONE__".len())
+                .any(|w| w == b"__TOMBSTONE__"),
+            "the tombstone sentinel value must be persisted alongside the key"
         );
 
         std::fs::remove_file(&path).unwrap();
