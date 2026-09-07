@@ -1,4 +1,5 @@
 mod bloom;
+mod compaction;
 mod memtable;
 mod sstable;
 mod types;
