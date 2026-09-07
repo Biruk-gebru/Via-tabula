@@ -9,6 +9,7 @@ use crate::types::is_tombstone;
 #[derive(Debug)]
 pub enum CompactionError {
     Io,
+    EmptySsTable,
 }
 
 impl From<SsTableError> for CompactionError {

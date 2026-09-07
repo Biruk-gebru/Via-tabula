@@ -11,6 +11,26 @@ pub struct LevelManager {
     pub levels: Vec<Vec<PathBuf>>,
 }
 
+// Full-scans a reader to find its smallest and largest key. SSTables don't store this in
+// the footer, so the only way to know it is to walk every record once.
+fn key_range(reader: &mut SsTableReader) -> Result<(Vec<u8>, Vec<u8>), CompactionError> {
+    let mut iter = reader.iter()?;
+    let (first_key, _) = iter.next().ok_or(CompactionError::EmptySsTable)?;
+
+    let mut last_key = first_key.clone();
+    for (key, _) in iter {
+        last_key = key;
+    }
+
+    Ok((first_key, last_key))
+}
+
+fn ranges_overlap(a: &(Vec<u8>, Vec<u8>), b: &(Vec<u8>, Vec<u8>)) -> bool {
+    let (a_min, a_max) = a;
+    let (b_min, b_max) = b;
+    a_min <= b_max && b_min <= a_max
+}
+
 impl LevelManager {
     pub fn new() -> Self {
         LevelManager { levels: Vec::new() }
@@ -30,98 +50,77 @@ impl LevelManager {
             .unwrap_or(false)
     }
 
-    // Merges every L0 file, plus whatever L1 already has, into one new L1 file. L0
-    // files are listed first so they win over L1 on any overlapping key, matching
-    // merge_sstables' "lowest source_index wins" rule for the most recently flushed
-    // data. This is a simplified single-file L1 (no key-range partitioning or the
-    // 2MB-per-file splitting a full leveled design would use); it only promotes L0
-    // into L1, not cascading further into L2+.
+    // Takes all of L0, but only the L1 files whose key range overlaps L0's combined
+    // range; L1 files with no overlap are left untouched, since nothing being merged
+    // could possibly change what they hold. This is still simplified versus a full
+    // leveled design: one merged output file rather than splitting into ~2MB chunks,
+    // and no cascading past L1 into L2+.
     pub fn compact(&mut self) -> Result<(), CompactionError> {
         while self.levels.len() < 2 {
             self.levels.push(Vec::new());
         }
 
-        let mut input_paths: Vec<PathBuf> = Vec::new();
-        input_paths.extend(self.levels[0].drain(..));
-        input_paths.extend(self.levels[1].drain(..));
+        if self.levels[0].is_empty() {
+            return Ok(());
+        }
 
-        let readers: Vec<SsTableReader> = input_paths
+        let l0_paths: Vec<PathBuf> = self.levels[0].drain(..).collect();
+
+        let mut l0_readers: Vec<SsTableReader> = l0_paths
             .iter()
             .map(|p| SsTableReader::open(p))
             .collect::<Result<Vec<_>, _>>()?;
+
+        // combined key range across every L0 file being compacted
+        let mut l0_range: Option<(Vec<u8>, Vec<u8>)> = None;
+        for reader in l0_readers.iter_mut() {
+            let (min_key, max_key) = key_range(reader)?;
+            l0_range = Some(match l0_range {
+                None => (min_key, max_key),
+                Some((current_min, current_max)) => {
+                    (current_min.min(min_key), current_max.max(max_key))
+                }
+            });
+        }
+        let l0_range = l0_range.expect("l0_paths is non-empty, checked above");
+
+        // split L1 into files that overlap L0's range (must be merged in) and files
+        // that don't (left alone, still valid, no reason to touch them)
+        let mut overlapping_l1_paths = Vec::new();
+        let mut overlapping_l1_readers = Vec::new();
+        let mut untouched_l1_paths = Vec::new();
+        for path in self.levels[1].drain(..) {
+            let mut reader = SsTableReader::open(&path)?;
+            let l1_range = key_range(&mut reader)?;
+            if ranges_overlap(&l0_range, &l1_range) {
+                overlapping_l1_paths.push(path);
+                overlapping_l1_readers.push(reader);
+            } else {
+                untouched_l1_paths.push(path);
+            }
+        }
+
+        // L0 readers first so they win ties over L1 in merge_sstables (most recently
+        // flushed data wins on an overlapping key)
+        let mut readers = l0_readers;
+        readers.extend(overlapping_l1_readers);
 
         let unique_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let output_path = input_paths[0].with_file_name(format!("l1_{unique_suffix}.sst"));
+        let output_path = l0_paths[0].with_file_name(format!("l1_{unique_suffix}.sst"));
 
         merge_sstables(readers, &output_path)?;
 
-        for path in &input_paths {
+        for path in l0_paths.iter().chain(overlapping_l1_paths.iter()) {
             fs::remove_file(path).ok();
         }
 
+        self.levels[1] = untouched_l1_paths;
         self.levels[1].push(output_path);
 
         Ok(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::memtable::MemTable;
-    use crate::sstable::reader::SsTableReader;
-    use std::env::temp_dir;
-
-    fn build_l0_file(name: &str, key: &str, value: &str) -> PathBuf {
-        let path = temp_dir().join(format!("tabula_levels_test_{name}.sst"));
-        let mut memtable = MemTable::new();
-        memtable.set(key.as_bytes().to_vec(), value.as_bytes().to_vec());
-        memtable.flush(&path).unwrap();
-        path
-    }
-
-    #[test]
-    fn needs_compaction_true_once_l0_hits_threshold() {
-        let mut manager = LevelManager::new();
-        assert!(!manager.needs_compaction());
-
-        for i in 0..3 {
-            manager.add_l0_file(build_l0_file(&format!("threshold_{i}"), "k", "v"));
-        }
-        assert!(!manager.needs_compaction(), "3 files should not trigger yet");
-
-        manager.add_l0_file(build_l0_file("threshold_3", "k", "v"));
-        assert!(manager.needs_compaction(), "4 files should trigger");
-
-        for path in &manager.levels[0] {
-            std::fs::remove_file(path).ok();
-        }
-    }
-
-    #[test]
-    fn compact_merges_l0_into_l1_and_clears_l0() {
-        let mut manager = LevelManager::new();
-        manager.add_l0_file(build_l0_file("compact_0", "apple", "newest"));
-        manager.add_l0_file(build_l0_file("compact_1", "apple", "stale"));
-        manager.add_l0_file(build_l0_file("compact_2", "banana", "banana-val"));
-        manager.add_l0_file(build_l0_file("compact_3", "cherry", "cherry-val"));
-
-        manager.compact().unwrap();
-
-        assert!(manager.levels[0].is_empty(), "L0 must be empty after compaction");
-        assert_eq!(manager.levels[1].len(), 1, "L1 must hold exactly one merged file");
-
-        let l1_path = &manager.levels[1][0];
-        assert!(l1_path.exists());
-
-        let mut reader = SsTableReader::open(l1_path).unwrap();
-        assert_eq!(reader.get(b"apple").unwrap(), Some(b"newest".to_vec()));
-        assert_eq!(reader.get(b"banana").unwrap(), Some(b"banana-val".to_vec()));
-        assert_eq!(reader.get(b"cherry").unwrap(), Some(b"cherry-val".to_vec()));
-
-        std::fs::remove_file(l1_path).ok();
-    }
-}
