@@ -1,6 +1,7 @@
 mod bloom;
 mod compaction;
 mod levels;
+mod lsm;
 mod memtable;
 mod sstable;
 mod types;

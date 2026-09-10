@@ -112,7 +112,21 @@ impl SsTableReader {
         })
     }
 
+    // Hides tombstones: Some(value) only for a live value, None for either "absent" or
+    // "deleted here". Fine for a single-file point lookup, but a caller checking
+    // multiple SSTables in newest-to-oldest order (the Lsm read path) needs to tell
+    // those two cases apart, so get_raw exists below for that.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, SsTableError> {
+        match self.get_raw(key)? {
+            Some(value) if is_tombstone(&value) => Ok(None),
+            other => Ok(other),
+        }
+    }
+
+    // Same lookup as get, but returns the raw record: Some(tombstone bytes) if this
+    // file's newest record for the key is a deletion, None only if the key never
+    // appears in this file at all.
+    pub fn get_raw(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, SsTableError> {
         // definitely absent: skip the index search and the disk seek entirely
         if !self.filter.may_contain(key) {
             return Ok(None);
@@ -163,14 +177,7 @@ impl SsTableReader {
             pos += (4 + key_len + 4 + val_len) as u64;
 
             match record_key.as_slice().cmp(key) {
-                std::cmp::Ordering::Equal => {
-                    // now that flush persists tombstones (so an older SSTable's value can't
-                    // resurrect), get must hide the sentinel from callers itself
-                    if is_tombstone(&record_val) {
-                        return Ok(None);
-                    }
-                    return Ok(Some(record_val));
-                }
+                std::cmp::Ordering::Equal => return Ok(Some(record_val)),
                 std::cmp::Ordering::Greater => return Ok(None),
                 std::cmp::Ordering::Less => continue,
             }
