@@ -1,6 +1,6 @@
 //i wil store 3 thinsg op key and value both key and value along ther length before they start
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 pub enum WalEntry {
@@ -75,6 +75,18 @@ impl Wal {
             .map_err(|_| WalError::Error)?;
         Ok(Wal { file })
     }
+    // Called once a flush has safely persisted everything the WAL was protecting, so
+    // its contents are now redundant. Caller must ensure nothing else appends to the
+    // WAL between the flush succeeding and this call, or a concurrent write's entry
+    // could be wiped out here despite that write never having reached an SSTable.
+    pub fn truncate(&mut self) -> Result<(), WalError> {
+        self.file.set_len(0).map_err(|_| WalError::Error)?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| WalError::Error)?;
+        Ok(())
+    }
+
     pub fn append(&mut self, entry: &WalEntry) -> Result<(), WalError> {
         let bytes = entry.encode();
         self.file.write_all(&bytes).map_err(|_| WalError::Error)
