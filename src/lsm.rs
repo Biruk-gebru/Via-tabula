@@ -54,6 +54,47 @@ pub struct Lsm {
     flush_threshold: usize,
 }
 
+// Rebuilds LevelManager on startup from whatever SSTable files already exist in dir,
+// so files flushed/compacted in a previous session aren't left orphaned and invisible.
+// Level is read from each file's own name (l0_..., l1_..., matching next_sstable_path
+// and LevelManager::compact's naming), no separate manifest file needed. Files within
+// each level are sorted by name, which sorts chronologically here since the suffix is
+// a nanosecond timestamp, so get's newest-to-oldest L0 scan still means something.
+fn discover_levels(dir: &Path) -> Result<LevelManager, LsmError> {
+    let mut manager = LevelManager::new();
+    manager.levels.push(Vec::new()); // L0
+    manager.levels.push(Vec::new()); // L1
+
+    for entry in std::fs::read_dir(dir).map_err(|_| LsmError::Io)? {
+        let path = entry.map_err(|_| LsmError::Io)?.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".sst") {
+            continue;
+        }
+
+        let Some(level_str) = name.strip_prefix('l').and_then(|rest| rest.split('_').next())
+        else {
+            continue;
+        };
+        let Ok(level) = level_str.parse::<usize>() else {
+            continue;
+        };
+
+        while manager.levels.len() <= level {
+            manager.levels.push(Vec::new());
+        }
+        manager.levels[level].push(path);
+    }
+
+    for level in manager.levels.iter_mut() {
+        level.sort();
+    }
+
+    Ok(manager)
+}
+
 impl Lsm {
     pub fn open(dir: &Path) -> Result<Self, LsmError> {
         std::fs::create_dir_all(dir).map_err(|_| LsmError::Io)?;
@@ -76,7 +117,7 @@ impl Lsm {
             dir: dir.to_path_buf(),
             mem: RwLock::new(mem),
             wal: Mutex::new(wal),
-            levels: RwLock::new(LevelManager::new()),
+            levels: RwLock::new(discover_levels(dir)?),
             flush_threshold: DEFAULT_FLUSH_THRESHOLD,
         })
     }
@@ -166,14 +207,26 @@ impl Lsm {
     fn flush_memtable(&self) -> Result<(), LsmError> {
         let path = self.next_sstable_path();
 
-        // swap the full MemTable out for an empty one so writers are only blocked for
-        // the instant it takes to swap a pointer, not for the whole flush's I/O
+        // Held for the whole flush, not just the MemTable swap below: if it were
+        // released right after the swap, a concurrent set/delete could append a WAL
+        // entry for data that's now sitting only in the fresh MemTable, and the
+        // truncate at the end would wipe that entry out even though it was never
+        // actually included in this flush - losing it permanently on a crash before
+        // the next flush. Holding the lock the whole time blocks new WAL appends
+        // until the old data is safely on disk and the WAL has been truncated to
+        // match. Consistent lock order with set/delete (wal always acquired before
+        // mem) avoids a deadlock between this and them.
+        let mut wal = self.wal.lock().unwrap();
+
+        // swap the full MemTable out for an empty one
         let old_mem = {
             let mut mem = self.mem.write().unwrap();
             std::mem::replace(&mut *mem, MemTable::new())
         };
 
         old_mem.flush(&path)?;
+        wal.truncate()?;
+        drop(wal);
 
         let mut levels = self.levels.write().unwrap();
         levels.add_l0_file(path);
@@ -194,6 +247,8 @@ impl Lsm {
 mod tests {
     use super::*;
     use std::env::temp_dir;
+    use std::sync::Arc;
+    use std::thread;
 
     fn test_dir(name: &str) -> PathBuf {
         let dir = temp_dir().join(format!("tabula_lsm_test_{name}"));
@@ -283,6 +338,51 @@ mod tests {
 
         let reopened = Lsm::open(&dir).unwrap();
         assert_eq!(reopened.get(b"hello").unwrap(), Some(b"world".to_vec()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_writes_during_a_flush_are_not_lost_on_restart() {
+        // regression test for the WAL truncate race: a write landing in the WAL
+        // between another thread's MemTable swap and its post-flush truncate must
+        // not be silently erased by that truncate
+        let dir = test_dir("wal_race");
+        let lsm = Arc::new(Lsm::open(&dir).unwrap());
+
+        let flushing = lsm.clone();
+        let flush_thread = thread::spawn(move || {
+            flushing
+                .set(b"big".to_vec(), vec![0u8; DEFAULT_FLUSH_THRESHOLD])
+                .unwrap();
+        });
+
+        let writer = lsm.clone();
+        let writer_thread = thread::spawn(move || {
+            for i in 0..50 {
+                writer
+                    .set(format!("concurrent-{i}").into_bytes(), b"v".to_vec())
+                    .unwrap();
+            }
+        });
+
+        flush_thread.join().unwrap();
+        writer_thread.join().unwrap();
+        drop(lsm);
+
+        let reopened = Lsm::open(&dir).unwrap();
+        assert_eq!(
+            reopened.get(b"big").unwrap(),
+            Some(vec![0u8; DEFAULT_FLUSH_THRESHOLD])
+        );
+        for i in 0..50 {
+            let key = format!("concurrent-{i}");
+            assert_eq!(
+                reopened.get(key.as_bytes()).unwrap(),
+                Some(b"v".to_vec()),
+                "{key} was lost across restart"
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
