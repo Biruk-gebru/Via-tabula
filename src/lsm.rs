@@ -17,8 +17,10 @@
 // without stalling the compaction thread.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::levels::LevelManager;
 use crate::memtable::MemTable;
@@ -50,8 +52,27 @@ pub struct Lsm {
     dir: PathBuf,
     mem: RwLock<MemTable>,
     wal: Mutex<Wal>,
-    levels: RwLock<LevelManager>,
+    // Arc, not a bare RwLock: the background compaction thread needs to keep touching
+    // this after open() returns and the caller moves/owns the returned Lsm, so this
+    // lock has to be independently, jointly owned rather than borrowed from self.
+    levels: Arc<RwLock<LevelManager>>,
     flush_threshold: usize,
+    shutdown: Arc<AtomicBool>,
+    compaction_thread: Option<JoinHandle<()>>,
+}
+
+const COMPACTION_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+impl Drop for Lsm {
+    // Signals the background thread to stop, then blocks until it actually has -
+    // "shuts down cleanly" means this returns only once the thread has genuinely
+    // exited, not just that we asked it to.
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.compaction_thread.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 // Rebuilds LevelManager on startup from whatever SSTable files already exist in dir,
@@ -113,12 +134,34 @@ impl Lsm {
             }
         }
 
+        let levels = Arc::new(RwLock::new(discover_levels(dir)?));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let compaction_thread = {
+            let levels = Arc::clone(&levels);
+            let shutdown = Arc::clone(&shutdown);
+            thread::spawn(move || {
+                while !shutdown.load(Ordering::Relaxed) {
+                    thread::sleep(COMPACTION_POLL_INTERVAL);
+
+                    let needs_compaction = levels.read().unwrap().needs_compaction();
+                    if needs_compaction {
+                        if let Err(err) = levels.write().unwrap().compact() {
+                            eprintln!("background compaction failed: {err:?}");
+                        }
+                    }
+                }
+            })
+        };
+
         Ok(Lsm {
             dir: dir.to_path_buf(),
             mem: RwLock::new(mem),
             wal: Mutex::new(wal),
-            levels: RwLock::new(discover_levels(dir)?),
+            levels,
             flush_threshold: DEFAULT_FLUSH_THRESHOLD,
+            shutdown,
+            compaction_thread: Some(compaction_thread),
         })
     }
 
@@ -384,6 +427,137 @@ mod tests {
             );
         }
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn background_thread_compacts_l0_without_being_called_directly() {
+        let dir = test_dir("background_compaction");
+        let lsm = Lsm::open(&dir).unwrap();
+
+        // 4 oversized writes each individually trigger a flush, producing 4 L0 files -
+        // needs_compaction's threshold - without ever calling compact() ourselves
+        for i in 0..4 {
+            lsm.set(
+                format!("big-{i}").into_bytes(),
+                vec![0u8; DEFAULT_FLUSH_THRESHOLD],
+            )
+            .unwrap();
+        }
+
+        // give the background thread a couple of poll cycles to notice and compact
+        thread::sleep(COMPACTION_POLL_INTERVAL * 3);
+
+        {
+            let levels = lsm.levels.read().unwrap();
+            assert!(
+                levels.levels[0].is_empty(),
+                "background thread should have compacted L0 away on its own"
+            );
+            assert_eq!(levels.levels[1].len(), 1);
+        }
+
+        // data must still be readable after the automatic compaction
+        for i in 0..4 {
+            let key = format!("big-{i}");
+            assert_eq!(
+                lsm.get(key.as_bytes()).unwrap(),
+                Some(vec![0u8; DEFAULT_FLUSH_THRESHOLD])
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dropping_lsm_shuts_down_the_background_thread() {
+        let dir = test_dir("clean_shutdown");
+        let lsm = Lsm::open(&dir).unwrap();
+
+        // Drop's join() blocks until the thread has actually exited; if shutdown
+        // signaling were broken, this would hang instead of returning
+        drop(lsm);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_writers_and_readers_1000_ops_each() {
+        const WRITERS: usize = 4;
+        const READERS: usize = 4;
+        const OPS_PER_THREAD: usize = 1000;
+
+        let dir = test_dir("stress");
+        let lsm = Arc::new(Lsm::open(&dir).unwrap());
+
+        // never written by any thread below: readers use this to prove they can never
+        // observe torn/corrupted data, even while writers are mutating other keys
+        // concurrently on the same locks
+        lsm.set(b"baseline".to_vec(), b"stable-value".to_vec())
+            .unwrap();
+
+        let mut handles = Vec::new();
+
+        // writers: each owns a disjoint key range, so the expected final state per key
+        // is deterministic once every thread has finished, with no cross-writer races
+        for writer_id in 0..WRITERS {
+            let lsm = Arc::clone(&lsm);
+            handles.push(thread::spawn(move || {
+                for i in 0..OPS_PER_THREAD {
+                    let key = format!("writer-{writer_id}-{i}").into_bytes();
+                    let value = format!("value-{writer_id}-{i}").into_bytes();
+                    lsm.set(key, value).unwrap();
+                }
+            }));
+        }
+
+        // readers: run concurrently with the writers above, repeatedly reading the
+        // untouched baseline key (must always come back correct) and opportunistically
+        // probing keys the writers may or may not have written yet (no assertion on
+        // those beyond "must not panic", since that outcome is inherently racy)
+        for reader_id in 0..READERS {
+            let lsm = Arc::clone(&lsm);
+            handles.push(thread::spawn(move || {
+                for i in 0..OPS_PER_THREAD {
+                    let baseline = lsm.get(b"baseline").unwrap();
+                    assert_eq!(
+                        baseline,
+                        Some(b"stable-value".to_vec()),
+                        "reader {reader_id} saw a corrupted baseline value on op {i}"
+                    );
+
+                    let probe_writer = i % WRITERS;
+                    let probe_key = format!("writer-{probe_writer}-{i}").into_bytes();
+                    lsm.get(&probe_key).unwrap();
+                }
+            }));
+        }
+
+        // .unwrap() here is the actual "assert no panics" check: if any spawned
+        // closure panicked, join() returns Err and this unwrap fails the test
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // final state check: every write from every thread must be present with
+        // exactly its expected value, now that all racing is done
+        for writer_id in 0..WRITERS {
+            for i in 0..OPS_PER_THREAD {
+                let key = format!("writer-{writer_id}-{i}");
+                let expected = format!("value-{writer_id}-{i}").into_bytes();
+                assert_eq!(
+                    lsm.get(key.as_bytes()).unwrap(),
+                    Some(expected),
+                    "{key} missing or wrong after all threads joined"
+                );
+            }
+        }
+        assert_eq!(
+            lsm.get(b"baseline").unwrap(),
+            Some(b"stable-value".to_vec())
+        );
+
+        drop(lsm);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
