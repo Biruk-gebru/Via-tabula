@@ -1,13 +1,4 @@
-mod bloom;
-mod compaction;
-mod levels;
-mod lsm;
-mod memtable;
-mod sstable;
-mod types;
-mod wal;
-
-use crate::memtable::MemTable;
+use tabula::memtable::MemTable;
 
 fn main() {
     let mut ltsm: MemTable = MemTable::new();
