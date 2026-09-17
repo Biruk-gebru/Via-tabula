@@ -40,18 +40,31 @@ pub struct SsTableWriter {
     bytes_since_last_index: usize,
     offset: u64,
     filter: BloomFilter,
+    // Reused across add() calls (cleared, not reallocated) so building each record's
+    // bytes doesn't allocate a fresh buffer every time. See add()'s comment for why
+    // it exists at all: M9's flamegraph showed this was worth doing.
+    record_buf: Vec<u8>,
 }
+
+// BufWriter's default (8 KB) is smaller than a typical flush's whole data section, so
+// the internal buffer already fills and triggers a real write() syscall multiple times
+// per flush regardless of how many userspace write_all calls we make - that syscall
+// count, not userspace copy count, is what wall-clock time is actually bottlenecked on
+// (see the M9 flamegraph discussion). 64 KB comfortably covers this benchmark's whole
+// flush (~30 KB), aiming to collapse most flushes down to a single real syscall.
+const WRITER_BUFFER_CAPACITY: usize = 64 * 1024;
 
 impl SsTableWriter {
     pub fn new(path: &Path, expected_keys: usize) -> Result<Self, SsTableError> {
         let fp_rate: f64 = 0.01;
         let file = File::create(path).map_err(|_| SsTableError::Io)?;
         Ok(SsTableWriter {
-            writer: BufWriter::new(file),
+            writer: BufWriter::with_capacity(WRITER_BUFFER_CAPACITY, file),
             index: Vec::new(),
             bytes_since_last_index: 0,
             offset: 0,
             filter: BloomFilter::new(expected_keys, fp_rate),
+            record_buf: Vec::new(),
         })
     }
 
@@ -64,16 +77,23 @@ impl SsTableWriter {
         let key_len = key.len() as u32;
         let val_len = value.len() as u32;
 
-        self.writer
-            .write_all(&key_len.to_le_bytes())
-            .map_err(|_| SsTableError::Io)?;
-        self.writer.write_all(key).map_err(|_| SsTableError::Io)?;
-        self.writer
-            .write_all(&val_len.to_le_bytes())
-            .map_err(|_| SsTableError::Io)?;
-        self.writer.write_all(value).map_err(|_| SsTableError::Io)?;
+        // M9 flamegraph (flamegraph_flush_isolated.svg): the top two hotspots inside
+        // flush were add() itself (40.6%) and a memmove (15.6%) from four separate
+        // write_all calls each copying into BufWriter's internal buffer on their own.
+        // Building the whole record in one buffer first and writing it in a single
+        // call cuts both: one copy into BufWriter instead of four, and no per-call
+        // heap allocation once record_buf's capacity settles (clear() keeps it).
+        self.record_buf.clear();
+        self.record_buf.extend_from_slice(&key_len.to_le_bytes());
+        self.record_buf.extend_from_slice(key);
+        self.record_buf.extend_from_slice(&val_len.to_le_bytes());
+        self.record_buf.extend_from_slice(value);
 
-        let record_size = 4 + key.len() + 4 + value.len();
+        self.writer
+            .write_all(&self.record_buf)
+            .map_err(|_| SsTableError::Io)?;
+
+        let record_size = self.record_buf.len();
         self.offset += record_size as u64;
         self.bytes_since_last_index += record_size;
         self.filter.insert(key);

@@ -1,3 +1,38 @@
+// M9 baseline (cargo bench, real defaults: 100 samples, 3s warm-up, 5s measurement):
+//   set_sequential_keys                ~51.3 µs
+//   set_random_keys                    ~258.6 µs   (~5x slower than sequential - random
+//                                                    keys force BTreeMap rebalancing all
+//                                                    over the tree, sequential ones only
+//                                                    ever insert at the current max)
+//   get_key_present                    ~41.2 ns
+//   get_key_absent_bloom_filter_path   ~42.9 ns    (essentially identical to present -
+//                                                    not what naive intuition expects
+//                                                    from "the Bloom filter skips work")
+//   memtable_flush_1000_keys           ~73.2 µs
+//
+// Flamegraph of memtable_flush_1000_keys (via a dedicated src/bin/profile_flush.rs
+// loop, not the criterion harness itself - profiling `cargo bench` directly showed
+// criterion's own bootstrap-resampling/formatting machinery as the top "hotspots",
+// which is a real example of a profiler lying to you if misread) showed SsTableWriter
+// ::add at 40.6% of flush's on-CPU time and a memmove at 15.6%, both from add()'s four
+// separate write_all calls each copying into BufWriter's internal buffer on their own.
+//
+// Optimization attempt 1: combined add()'s four write_all calls into one (build the
+// record in a reused buffer, write it once). Re-measured: no significant change
+// (p = 0.47). Reason: BufWriter already batches writes internally regardless of
+// userspace call count, and cargo flamegraph only samples on-CPU time - it can't see
+// time a thread spends blocked waiting on a write() syscall, so it over-weighted the
+// cheap userspace copies relative to their real share of wall-clock time.
+//
+// Optimization attempt 2: BufWriter's default capacity (8 KB) is smaller than a
+// typical flush's data section (~30 KB for this benchmark), so its internal buffer
+// already fills and triggers a real write() syscall multiple times per flush
+// regardless of attempt 1's userspace batching. Raised it to 64 KB
+// (WRITER_BUFFER_CAPACITY in sstable/writer.rs), aiming to collapse most flushes to a
+// single real syscall. Re-measured: memtable_flush_1000_keys ~59.6 µs, a ~9.3% drop
+// (p = 0.00, "Performance has improved"). This is the one that actually targeted the
+// real bottleneck (syscall count, not userspace copy count).
+
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use std::hint::black_box;
 use std::path::PathBuf;
