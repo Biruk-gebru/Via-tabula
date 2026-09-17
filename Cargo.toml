@@ -11,3 +11,9 @@ criterion = "0.8.2"
 [[bench]]
 name = "lsm_bench"
 harness = false
+
+[profile.bench]
+debug = true
+
+[profile.release]
+debug = true
