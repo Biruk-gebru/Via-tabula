@@ -1,3 +1,22 @@
+// Profiling is a tricky game, since most tools don't profile just the code at hand but
+// the whole process, and asking for more would need the process to have kernel-level
+// access, which is very unsafe. So, three ways a microbenchmark can lie to you:
+//
+// 1. Tracking elapsed (wall-clock) time, while much of it can be spent with the
+//    process asleep or blocked (e.g. waiting on a disk write's syscall) rather than
+//    actually doing CPU work - a CPU-time profiler won't see that blocked time at all.
+//
+// 2. Profiling the whole harness, not just the code under test: the profiling loop
+//    itself (criterion's own bootstrap-resampling, terminal formatting, etc.) creates
+//    a huge blob of irrelevant data, which can lead you to "optimize" superficial code
+//    that was never the actual bottleneck.
+//
+// 3. The compiler's optimizer silently deleting the benchmarked work entirely: if a
+//    computed value is never used, the optimizer can notice and remove the whole
+//    computation as dead code, so you end up benchmarking nothing. That's exactly why
+//    every bench function below wraps its result in black_box(...) - without it,
+//    cargo bench could report an impossibly fast, meaningless number.
+
 // M9 baseline (cargo bench, real defaults: 100 samples, 3s warm-up, 5s measurement):
 //   set_sequential_keys                ~51.3 µs
 //   set_random_keys                    ~258.6 µs   (~5x slower than sequential - random
@@ -33,7 +52,7 @@
 // (p = 0.00, "Performance has improved"). This is the one that actually targeted the
 // real bottleneck (syscall count, not userspace copy count).
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::path::PathBuf;
 
