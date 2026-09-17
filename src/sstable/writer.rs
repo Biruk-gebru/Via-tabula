@@ -25,7 +25,7 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::bloom::BloomFilter;
 
@@ -44,6 +44,11 @@ pub struct SsTableWriter {
     // bytes doesn't allocate a fresh buffer every time. See add()'s comment for why
     // it exists at all: M9's flamegraph showed this was worth doing.
     record_buf: Vec<u8>,
+    // The name the caller actually asked for. We write to tmp_path instead and only
+    // rename to this at the very end of finish(), so a crash mid-write never leaves a
+    // half-formed file sitting under the name a reader would expect a real one at.
+    final_path: PathBuf,
+    tmp_path: PathBuf,
 }
 
 // BufWriter's default (8 KB) is smaller than a typical flush's whole data section, so
@@ -57,7 +62,8 @@ const WRITER_BUFFER_CAPACITY: usize = 64 * 1024;
 impl SsTableWriter {
     pub fn new(path: &Path, expected_keys: usize) -> Result<Self, SsTableError> {
         let fp_rate: f64 = 0.01;
-        let file = File::create(path).map_err(|_| SsTableError::Io)?;
+        let tmp_path = path.with_extension("tmp");
+        let file = File::create(&tmp_path).map_err(|_| SsTableError::Io)?;
         Ok(SsTableWriter {
             writer: BufWriter::with_capacity(WRITER_BUFFER_CAPACITY, file),
             index: Vec::new(),
@@ -65,6 +71,8 @@ impl SsTableWriter {
             offset: 0,
             filter: BloomFilter::new(expected_keys, fp_rate),
             record_buf: Vec::new(),
+            final_path: path.to_path_buf(),
+            tmp_path,
         })
     }
 
@@ -144,6 +152,46 @@ impl SsTableWriter {
             .write_all(&index_len.to_le_bytes())
             .map_err(|_| SsTableError::Io)?;
 
-        self.writer.flush().map_err(|_| SsTableError::Io)
+        self.writer.flush().map_err(|_| SsTableError::Io)?;
+
+        // Atomic on the same filesystem: final_path either doesn't exist yet at all,
+        // or exists fully-formed, footer included - never observable half-written,
+        // even across a crash right here.
+        std::fs::rename(&self.tmp_path, &self.final_path).map_err(|_| SsTableError::Io)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env::temp_dir;
+
+    #[test]
+    fn final_path_does_not_exist_until_finish_succeeds() {
+        let path = temp_dir().join("tabula_writer_test_atomic.sst");
+        std::fs::remove_file(&path).ok();
+
+        let mut writer = SsTableWriter::new(&path, 10).unwrap();
+        writer.add(b"key", b"value").unwrap();
+
+        // mid-write: the real name must not exist yet, only the tmp one
+        assert!(
+            !path.exists(),
+            "final path must not exist before finish() completes"
+        );
+        let tmp_path = path.with_extension("tmp");
+        assert!(tmp_path.exists(), "writes must land in the tmp file");
+
+        writer.finish().unwrap();
+
+        // after finish(): the real name exists, and the tmp name is gone (renamed,
+        // not copied)
+        assert!(path.exists(), "final path must exist once finish() succeeds");
+        assert!(
+            !tmp_path.exists(),
+            "tmp path must not survive a successful finish()"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 }
