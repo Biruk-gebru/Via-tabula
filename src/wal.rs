@@ -160,9 +160,22 @@ impl Wal {
         let mut cursor = 0;
 
         while cursor < bytes.len() {
-            let (entry, consumed) = WalEntry::decode(&bytes[cursor..])?;
-            entries.push(entry);
-            cursor += consumed;
+            match WalEntry::decode(&bytes[cursor..]) {
+                Ok((entry, consumed)) => {
+                    entries.push(entry);
+                    cursor += consumed;
+                }
+                Err(_) => {
+                    // The WAL is append-only: everything before this point was
+                    // already fully appended and durable before this entry was ever
+                    // started, so only the tail can plausibly be an in-progress
+                    // write interrupted by a crash. Stop here and keep what decoded
+                    // cleanly rather than failing the whole replay - and thus
+                    // refusing to start up at all - over one truncated or corrupted
+                    // trailing entry.
+                    break;
+                }
+            }
         }
 
         Ok(entries)
@@ -303,6 +316,58 @@ mod tests {
         std::fs::write(&path, b"").unwrap();
         let entries = Wal::replay(&path).unwrap();
         assert_eq!(entries.len(), 0);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_replay_stops_at_truncated_tail_without_failing() {
+        let path = PathBuf::from("/tmp/tabula_test_wal_truncated_tail.bin");
+        let _ = std::fs::remove_file(&path);
+
+        let mut raw = Vec::new();
+        raw.extend(
+            WalEntry::Put {
+                key: b"foo".to_vec(),
+                value: b"bar".to_vec(),
+            }
+            .encode(),
+        );
+        raw.extend(
+            WalEntry::Delete {
+                key: b"foo".to_vec(),
+            }
+            .encode(),
+        );
+
+        // simulate a crash mid-append: write only a prefix of a third entry's bytes
+        // directly to the file, bypassing Wal::append entirely, so this isn't an
+        // artificial in-memory slice - it's an actual truncated file on disk
+        let third_entry_bytes = WalEntry::Put {
+            key: b"baz".to_vec(),
+            value: b"qux".to_vec(),
+        }
+        .encode();
+        raw.extend(&third_entry_bytes[..third_entry_bytes.len() - 3]);
+
+        std::fs::write(&path, &raw).unwrap();
+
+        // must recover the two complete entries, not fail to open at all over the
+        // truncated third one
+        let entries = Wal::replay(&path).unwrap();
+        assert_eq!(entries.len(), 2, "should recover exactly the complete entries");
+
+        match &entries[0] {
+            WalEntry::Put { key, value } => {
+                assert_eq!(key, b"foo");
+                assert_eq!(value, b"bar");
+            }
+            _ => panic!("expected Put"),
+        }
+        match &entries[1] {
+            WalEntry::Delete { key } => assert_eq!(key, b"foo"),
+            _ => panic!("expected Delete"),
+        }
+
         std::fs::remove_file(&path).unwrap();
     }
 }
