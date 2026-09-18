@@ -168,10 +168,15 @@ impl Lsm {
     pub fn set(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), LsmError> {
         {
             let mut wal = self.wal.lock().unwrap();
-            wal.append(&WalEntry::Put {
-                key: key.clone(),
-                value: value.clone(),
-            })?;
+            // sync=false: preserves Lsm's existing default (throughput over the
+            // per-write durability sync=true would add). See Wal::append's comment.
+            wal.append(
+                &WalEntry::Put {
+                    key: key.clone(),
+                    value: value.clone(),
+                },
+                false,
+            )?;
         }
 
         let needs_flush = {
@@ -231,7 +236,7 @@ impl Lsm {
     pub fn delete(&self, key: Vec<u8>) -> Result<(), LsmError> {
         {
             let mut wal = self.wal.lock().unwrap();
-            wal.append(&WalEntry::Delete { key: key.clone() })?;
+            wal.append(&WalEntry::Delete { key: key.clone() }, false)?;
         }
 
         let needs_flush = {

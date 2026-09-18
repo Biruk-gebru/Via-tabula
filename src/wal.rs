@@ -149,9 +149,29 @@ impl Wal {
         Ok(())
     }
 
-    pub fn append(&mut self, entry: &WalEntry) -> Result<(), WalError> {
+    // sync=false (the fast path): write_all only guarantees the bytes reach the OS
+    // page cache. A process crash is still safe (the OS finishes the write to disk on
+    // its own), but a power loss between this call returning and the OS's next flush
+    // can lose the entry even though append already reported success.
+    //
+    // sync=true (the durable path): blocks until the OS confirms the bytes are
+    // physically on disk (fdatasync via File::sync_data - not full fsync, which would
+    // also flush file metadata like timestamps that replay never reads back and so
+    // isn't worth paying for here). Survives power loss too, at the cost of real
+    // disk-I/O latency on every single append instead of a fast in-memory copy.
+    //
+    // The tradeoff is throughput vs. a rare-event guarantee: sync=true pays that cost
+    // on every write, whether or not power is ever actually lost. Whether it's worth
+    // it depends on how costly losing the last few writes would be for a given use
+    // case - which is why this is a per-call choice rather than one fixed answer.
+    // See benches/lsm_bench.rs for measured numbers.
+    pub fn append(&mut self, entry: &WalEntry, sync: bool) -> Result<(), WalError> {
         let bytes = entry.encode();
-        self.file.write_all(&bytes).map_err(|_| WalError::Error)
+        self.file.write_all(&bytes).map_err(|_| WalError::Error)?;
+        if sync {
+            self.file.sync_data().map_err(|_| WalError::Error)?;
+        }
+        Ok(())
     }
 
     pub fn replay(path: &Path) -> Result<Vec<WalEntry>, WalError> {
@@ -270,19 +290,28 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let mut wal = Wal::open(&path).unwrap();
-        wal.append(&WalEntry::Put {
-            key: b"foo".to_vec(),
-            value: b"bar".to_vec(),
-        })
+        wal.append(
+            &WalEntry::Put {
+                key: b"foo".to_vec(),
+                value: b"bar".to_vec(),
+            },
+            false,
+        )
         .unwrap();
-        wal.append(&WalEntry::Delete {
-            key: b"foo".to_vec(),
-        })
+        wal.append(
+            &WalEntry::Delete {
+                key: b"foo".to_vec(),
+            },
+            false,
+        )
         .unwrap();
-        wal.append(&WalEntry::Put {
-            key: b"baz".to_vec(),
-            value: b"qux".to_vec(),
-        })
+        wal.append(
+            &WalEntry::Put {
+                key: b"baz".to_vec(),
+                value: b"qux".to_vec(),
+            },
+            false,
+        )
         .unwrap();
 
         let entries = Wal::replay(&path).unwrap();

@@ -51,6 +51,18 @@
 // single real syscall. Re-measured: memtable_flush_1000_keys ~59.6 µs, a ~9.3% drop
 // (p = 0.00, "Performance has improved"). This is the one that actually targeted the
 // real bottleneck (syscall count, not userspace copy count).
+//
+// M10 task 4: Wal::append sync=false vs sync=true (fdatasync after every write):
+//   wal_append_sync_false   ~1.40 µs
+//   wal_append_sync_true    ~3.99 ms    (~2,850x slower)
+// sync=false only guarantees the entry reached the OS page cache; a power loss (not
+// just a process crash) before the OS's next flush can lose it despite append already
+// having returned Ok. sync=true blocks until fdatasync confirms it's physically on
+// disk - real durability, at a real cost. ~2,850x isn't a rounding error: paying that
+// on every single write only makes sense if losing the last few unflushed writes on a
+// rare power failure would be worse than the throughput hit of syncing constantly to
+// guard against it. Lsm::set/delete default to sync=false (unchanged behavior); a
+// caller who needs the stronger guarantee can request sync=true per write.
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -58,6 +70,7 @@ use std::path::PathBuf;
 
 use tabula::lsm::Lsm;
 use tabula::memtable::MemTable;
+use tabula::wal::{Wal, WalEntry};
 
 // Tiny deterministic PRNG (xorshift64) so the "random keys" benchmark is reproducible
 // without pulling in the `rand` crate, matching this project's zero-dependency scope.
@@ -178,12 +191,56 @@ fn bench_memtable_flush(c: &mut Criterion) {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+fn bench_wal_append_no_sync(c: &mut Criterion) {
+    let dir = bench_dir("wal_no_sync");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut wal = Wal::open(&dir.join("wal.log")).unwrap();
+
+    c.bench_function("wal_append_sync_false", |b| {
+        b.iter(|| {
+            wal.append(
+                black_box(&WalEntry::Put {
+                    key: b"key".to_vec(),
+                    value: b"value".to_vec(),
+                }),
+                false,
+            )
+            .unwrap();
+        });
+    });
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn bench_wal_append_sync(c: &mut Criterion) {
+    let dir = bench_dir("wal_sync");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut wal = Wal::open(&dir.join("wal.log")).unwrap();
+
+    c.bench_function("wal_append_sync_true", |b| {
+        b.iter(|| {
+            wal.append(
+                black_box(&WalEntry::Put {
+                    key: b"key".to_vec(),
+                    value: b"value".to_vec(),
+                }),
+                true,
+            )
+            .unwrap();
+        });
+    });
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 criterion_group!(
     benches,
     bench_set_sequential,
     bench_set_random,
     bench_get_present,
     bench_get_absent,
-    bench_memtable_flush
+    bench_memtable_flush,
+    bench_wal_append_no_sync,
+    bench_wal_append_sync
 );
 criterion_main!(benches);
