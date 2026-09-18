@@ -29,7 +29,3 @@ cargo run
 cargo test
 cargo bench
 ```
-
-## How this was built
-
-This project follows `GUIDE.md`, a self study guide with ten milestones, each one a real piece of the engine: the MemTable, the WAL, SSTables, Bloom filters, compaction, concurrency, benchmarking, and crash recovery. Every milestone has a design question to answer before writing any code, and a checkpoint to pass before moving to the next one.
