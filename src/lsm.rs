@@ -560,4 +560,39 @@ mod tests {
         drop(lsm);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn crash_recovery_survives_mem_forget() {
+        // M10 task 3: 500 writes, then simulate a crash - not a normal shutdown.
+        // mem::forget skips Drop entirely (no background-thread signal, no join, no
+        // WAL/file cleanup), unlike every other test's `drop(lsm)`/scope-exit, which
+        // runs Drop and would mask exactly the kind of unclean-shutdown bug this test
+        // exists to catch. The compaction thread this leaks is expected and
+        // intentional here - joining it would defeat the point of the test.
+        let dir = test_dir("crash_recovery");
+        let lsm = Lsm::open(&dir).unwrap();
+
+        let mut expected = Vec::new();
+        for i in 0..500u32 {
+            let key = format!("key-{i:05}").into_bytes();
+            let value = format!("value-{i:05}").into_bytes();
+            lsm.set(key.clone(), value.clone()).unwrap();
+            expected.push((key, value));
+        }
+
+        std::mem::forget(lsm);
+
+        let reopened = Lsm::open(&dir).unwrap();
+        for (key, value) in &expected {
+            assert_eq!(
+                reopened.get(key).unwrap(),
+                Some(value.clone()),
+                "key {:?} missing or wrong after crash recovery",
+                String::from_utf8_lossy(key)
+            );
+        }
+
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
