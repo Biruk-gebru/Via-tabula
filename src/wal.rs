@@ -3,6 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
+#[derive(Debug)]
 pub enum WalEntry {
     Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
@@ -10,7 +11,28 @@ pub enum WalEntry {
 
 #[derive(Debug)]
 pub enum WalError {
+    // Not enough bytes present to even parse the entry's declared shape - the OS
+    // flushed a prefix of the entry and nothing more, the classic partial-write case.
     Error,
+    // Enough bytes were present and parsed cleanly, but the checksum computed over
+    // them doesn't match what was stored - the bytes were altered after being
+    // written (or a length field itself was corrupted, producing a "valid-looking"
+    // but wrong slice). Length-checking alone can never catch this.
+    Checksum,
+}
+
+// Standard CRC-32 (IEEE 802.3), same algorithm the crc32fast crate implements -
+// hand-rolled here to keep this project's zero-runtime-dependency scope,
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFFFFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = if crc & 1 != 0 { 0xEDB88320 } else { 0 };
+            crc = (crc >> 1) ^ mask;
+        }
+    }
+    !crc
 }
 
 impl WalEntry {
@@ -33,32 +55,72 @@ impl WalEntry {
                 code.extend_from_slice(key);
             }
         }
+        // checksum covers every byte written above (op, lengths, key, value), so any
+        // change to any of them is caught on decode
+        let checksum = crc32(&code);
+        code.extend_from_slice(&checksum.to_le_bytes());
         code
     }
 
     pub fn decode(code: &[u8]) -> Result<(WalEntry, usize), WalError> {
-        match code[0] {
+        // op tag: 1 byte. Every subsequent bounds check below exists because this
+        // buffer may be a truncated tail entry - a real partial write, not a bug -
+        // and slicing past its end must return an error, never panic.
+        let op = *code.first().ok_or(WalError::Error)?;
+
+        let (entry, body_len) = match op {
             0u8 => {
+                if code.len() < 5 {
+                    return Err(WalError::Error);
+                }
                 let key_len = u32::from_le_bytes(code[1..5].try_into().unwrap()) as usize;
-                let key = code[5..5 + key_len].to_vec();
+
+                let val_len_start = 5 + key_len;
+                if code.len() < val_len_start + 4 {
+                    return Err(WalError::Error);
+                }
+                let key = code[5..val_len_start].to_vec();
                 let val_len =
-                    u32::from_le_bytes(code[5 + key_len..9 + key_len].try_into().unwrap()) as usize;
-                let val = code[9 + key_len..9 + key_len + val_len].to_vec();
-                Ok((
-                    WalEntry::Put {
-                        key: key,
-                        value: val,
-                    },
-                    1 + key_len + 8 + val_len,
-                ))
+                    u32::from_le_bytes(code[val_len_start..val_len_start + 4].try_into().unwrap())
+                        as usize;
+
+                let val_start = val_len_start + 4;
+                let body_len = val_start + val_len;
+                if code.len() < body_len {
+                    return Err(WalError::Error);
+                }
+                let value = code[val_start..body_len].to_vec();
+
+                (WalEntry::Put { key, value }, body_len)
             }
             1u8 => {
+                if code.len() < 5 {
+                    return Err(WalError::Error);
+                }
                 let key_len = u32::from_le_bytes(code[1..5].try_into().unwrap()) as usize;
-                let key = code[5..5 + key_len].to_vec();
-                Ok((WalEntry::Delete { key: key }, 1 + 4 + key_len))
+
+                let body_len = 5 + key_len;
+                if code.len() < body_len {
+                    return Err(WalError::Error);
+                }
+                let key = code[5..body_len].to_vec();
+
+                (WalEntry::Delete { key }, body_len)
             }
-            _ => Err(WalError::Error),
+            _ => return Err(WalError::Error),
+        };
+
+        // the 4-byte checksum trails the entry's body; still need those bytes present
+        if code.len() < body_len + 4 {
+            return Err(WalError::Error);
         }
+        let stored_checksum = u32::from_le_bytes(code[body_len..body_len + 4].try_into().unwrap());
+        let actual_checksum = crc32(&code[0..body_len]);
+        if actual_checksum != stored_checksum {
+            return Err(WalError::Checksum);
+        }
+
+        Ok((entry, body_len + 4))
     }
 }
 
@@ -132,7 +194,9 @@ mod tests {
 
     #[test]
     fn test_encode_decode_delete() {
-        let entry = WalEntry::Delete { key: b"bye".to_vec() };
+        let entry = WalEntry::Delete {
+            key: b"bye".to_vec(),
+        };
         let bytes = entry.encode();
         let (decoded, consumed) = WalEntry::decode(&bytes).unwrap();
         match decoded {
@@ -149,14 +213,64 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_truncated_entry_returns_error_not_panic() {
+        let entry = WalEntry::Put {
+            key: b"hello".to_vec(),
+            value: b"world".to_vec(),
+        };
+        let bytes = entry.encode();
+
+        // simulate the OS having flushed only a prefix of the entry: try every
+        // possible truncation point, none of them should ever panic
+        for cut in 0..bytes.len() {
+            let result = WalEntry::decode(&bytes[..cut]);
+            assert!(
+                matches!(result, Err(WalError::Error)),
+                "truncating to {cut} bytes should return WalError::Error, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_corrupted_bytes_returns_checksum_error() {
+        let entry = WalEntry::Put {
+            key: b"hello".to_vec(),
+            value: b"world".to_vec(),
+        };
+        let mut bytes = entry.encode();
+
+        // flip a bit inside the value, well within bounds, so length checks all pass
+        // and only the checksum comparison can catch this
+        let last = bytes.len() - 5; // last byte of "world", before the 4B checksum
+        bytes[last] ^= 0xFF;
+
+        let result = WalEntry::decode(&bytes);
+        assert!(
+            matches!(result, Err(WalError::Checksum)),
+            "corrupted body should return WalError::Checksum, got {result:?}"
+        );
+    }
+
+    #[test]
     fn test_append_and_replay() {
         let path = PathBuf::from("/tmp/tabula_test_wal.bin");
         let _ = std::fs::remove_file(&path);
 
         let mut wal = Wal::open(&path).unwrap();
-        wal.append(&WalEntry::Put { key: b"foo".to_vec(), value: b"bar".to_vec() }).unwrap();
-        wal.append(&WalEntry::Delete { key: b"foo".to_vec() }).unwrap();
-        wal.append(&WalEntry::Put { key: b"baz".to_vec(), value: b"qux".to_vec() }).unwrap();
+        wal.append(&WalEntry::Put {
+            key: b"foo".to_vec(),
+            value: b"bar".to_vec(),
+        })
+        .unwrap();
+        wal.append(&WalEntry::Delete {
+            key: b"foo".to_vec(),
+        })
+        .unwrap();
+        wal.append(&WalEntry::Put {
+            key: b"baz".to_vec(),
+            value: b"qux".to_vec(),
+        })
+        .unwrap();
 
         let entries = Wal::replay(&path).unwrap();
         assert_eq!(entries.len(), 3);
